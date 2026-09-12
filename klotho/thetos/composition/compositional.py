@@ -2622,7 +2622,7 @@ class CompositionalUnit(TemporalUnit):
                     f"existing_pfields={sorted(desc['pfields'])})"
                 )
 
-    def _control_envelope_timing(self, leaves, span_leaves=None):
+    def _control_envelope_timing(self, leaves, span_leaves=None, endpoint=True):
         """The span's own RELATIVE geometry, as a comparable signature.
 
         ``baked_leaves`` answers *which* leaves the stored values were computed
@@ -2654,6 +2654,17 @@ class CompositionalUnit(TemporalUnit):
         fire, and the half stayed frozen at its pre-edit values through every
         structural edit. Defaults to ``leaves``, which is the whole span exactly
         when the envelope is unsplit.
+
+        ``endpoint`` must be the DESCRIPTOR'S, because it decides where the span
+        ends and therefore what "the same layout" means. ``_curve_windows`` ends
+        the span at the last ONSET when ``endpoint`` is false and at the last
+        RELEASE when it is true; this used to end it at the last release always.
+        The two disagreeing is not cosmetic: under ``endpoint=False`` a change to
+        the final onset moved the windows and left this signature identical, so a
+        sibling's rebake refreshed a member's published window while the gate
+        declined to rebake its values -- the right numbers in ``uc.events`` and
+        the wrong ramp in the audio, which is the exact divergence ``AF35-43``
+        was filed for.
 
         Returns ``None`` when the geometry cannot be read -- a leaf without a
         metric layer, which happens mid-mutation, or a degenerate zero-width
@@ -2688,7 +2699,14 @@ class CompositionalUnit(TemporalUnit):
                 span_rows.append((float(entry['real_onset']),
                                   abs(float(entry['real_duration']))))
         start = min(o for o, _ in span_rows)
-        end = max(o + d for o, d in span_rows)
+        # ``endpoint=False`` with a span one leaf wide has zero width, and
+        # ``_bake_envelope`` falls back to the whole note in exactly that case;
+        # mirror it rather than answering "unknown", which would silently
+        # disable the gate.
+        end = (max(o + d for o, d in span_rows) if endpoint
+               else max(o for o, _ in span_rows))
+        if end - start <= 0:
+            end = max(o + d for o, d in span_rows)
         width = end - start
         if width <= 0:
             return None
@@ -2725,9 +2743,14 @@ class CompositionalUnit(TemporalUnit):
         group = desc.get("split_group")
         if group is None:
             return None
+        cache = getattr(self, '_split_group_cache', None)
+        if cache is not None and group in cache:
+            return cache[group]
         members = [d for d in self._control_envelopes.values()
                    if d.get("split_group") == group]
         if len(members) < 2:
+            if cache is not None:
+                cache[group] = None
             return None
         try:
             self._ensure_timing_cache()
@@ -2737,12 +2760,54 @@ class CompositionalUnit(TemporalUnit):
         rows = []
         for d in members:
             leaves = tuple(self._resolve_control_envelope_leaves(d))
-            if not leaves or any(times.get(n) is None for n in leaves):
+            if not leaves:
+                # A run whose every leaf is now a rest resolves to nothing. It
+                # has no notes to control, so it contributes no window -- but it
+                # is NOT a reason to give up on the group. Bailing on the
+                # weakest member re-froze every other member, whose geometry was
+                # perfectly readable: resting one leaf undid this whole fix.
+                continue
+            if any(times.get(n) is None for n in leaves):
+                # unreadable geometry IS a reason to stop: mid-mutation a leaf
+                # has no metric layer and every window computed here would be
+                # nonsense.
                 return None
             rows.append((min(float(times[n]['real_onset']) for n in leaves),
                          d, leaves))
+        if len(rows) < 2:
+            return None
         rows.sort(key=lambda r: r[0])
-        return [(d, leaves) for _, d, leaves in rows]
+        result = [(d, leaves) for _, d, leaves in rows]
+        if cache is not None:
+            cache[group] = result
+        return result
+
+    @contextmanager
+    def _split_group_pass(self):
+        """Resolve each split group's members once for the whole pass.
+
+        The rebake gate asks every descriptor whether its timing moved, and each
+        question used to re-resolve every member of that descriptor's group: with
+        n descriptors, O(n^2) resolves per announcement, which the tree door then
+        pays once per binding. Measured before this: 16,768 resolves for one
+        announcement over 128 descriptors, 84% of the call.
+
+        Safe for the gate and the flush because neither adds or removes a
+        descriptor, and because a rebake writes pfields only -- the flush's own
+        docstring records that timings are provably unchanged across the
+        ``_structure_version`` bump a rebake causes. It is deliberately NOT held
+        across a split, which does churn descriptors.
+        """
+        outermost = getattr(self, '_split_group_cache', None) is None
+        if outermost:
+            self._split_group_cache = {}
+            self._split_group_refreshed = set()
+        try:
+            yield
+        finally:
+            if outermost:
+                self._split_group_cache = None
+                self._split_group_refreshed = None
 
     def _split_group_span(self, desc):
         """The whole envelope's live leaves, for a descriptor that is one run.
@@ -2772,12 +2837,22 @@ class CompositionalUnit(TemporalUnit):
         if members is None:
             return None
         runs = [leaves for _, leaves in members]
+        # Once per group per pass. The windows are a property of the GROUP, so
+        # recomputing them for every pending member is the same answer n times:
+        # measured, that was the whole of the remaining quadratic in a
+        # structural edit (116 ms for one ``scale`` over 256 runs).
+        done = getattr(self, '_split_group_refreshed', None)
+        group = desc.get("split_group")
+        if done is not None and group in done:
+            return [n for run in runs for n in run]
         try:
             windows = self._curve_windows(runs, desc["endpoint"])
         except Exception:
             return None
         for (d, _), window in zip(members, windows):
             d["curve_window"] = window
+        if done is not None:
+            done.add(group)
         return [n for run in runs for n in run]
 
     def _rebake_control_envelope(self, desc):
@@ -2794,7 +2869,8 @@ class CompositionalUnit(TemporalUnit):
                                 desc["endpoint"],
                                 curve_window=desc.get("curve_window"))
         desc["baked_leaves"] = tuple(sounding)
-        desc["baked_timing"] = self._control_envelope_timing(sounding, span)
+        desc["baked_timing"] = self._control_envelope_timing(
+            sounding, span, desc["endpoint"])
 
     def _record_control_envelope(self, selected, envelope, pfields_list, endpoint):
         self._ensure_timing_cache()
@@ -2850,7 +2926,7 @@ class CompositionalUnit(TemporalUnit):
                 # Normalised to the WHOLE span, not to this run: a run signed
                 # against itself cannot see its own position move, and a
                 # one-leaf run signed against itself is a constant (AF35-4).
-                "baked_timing": self._control_envelope_timing(run, sounding),
+                "baked_timing": self._control_envelope_timing(run, sounding, endpoint),
                 # the slice of the whole curve this descriptor carries, so a
                 # later rebake reproduces its VALUES rather than restarting
                 # the gesture. ``(0.0, 1.0)`` for an unsplit envelope.
@@ -3482,7 +3558,7 @@ class CompositionalUnit(TemporalUnit):
             split_group = self._next_envelope_split_group
             self._next_envelope_split_group += 1
         del self._control_envelopes[env_id]
-        whole = tuple(resolved)
+        new_ids = []
         for run, (inner_start, inner_end) in zip(
                 runs, self._curve_windows(runs, desc["endpoint"])):
             new_id = env_id if run is runs[0] else self._next_envelope_id
@@ -3492,11 +3568,28 @@ class CompositionalUnit(TemporalUnit):
                 **desc,
                 "leaf_subset": tuple(run),
                 "baked_leaves": tuple(run),
-                "baked_timing": self._control_envelope_timing(run, whole),
+                # filled in below, once every sibling is registered
+                "baked_timing": None,
                 "curve_window": (start + inner_start * width,
                                  start + inner_end * width),
                 "split_group": split_group,
             }
+            new_ids.append(new_id)
+        # The signature has to be recorded against the SAME span its reader will
+        # normalise against, and the reader (``_timing_moved`` via
+        # ``_split_group_span``) uses the whole GROUP. Recording it against the
+        # leaves of the descriptor being cut is only the same span while that
+        # descriptor is the whole envelope: the moment a group member is itself
+        # re-split, the two bases differ and every new descriptor reads STALE on
+        # creation with nothing moved -- so the next edit anywhere rebaked them
+        # over the composer's own later ``set_pfields``, which is the ENV-6
+        # last-write-wins promise the gate exists to keep. Hence: after the loop,
+        # when the group is complete.
+        for nid in new_ids:
+            nd = self._control_envelopes[nid]
+            nd["baked_timing"] = self._control_envelope_timing(
+                self._resolve_control_envelope_leaves(nd),
+                self._split_group_span(nd), nd["endpoint"])
 
     def _split_slurs_for_rests(self, nodes_to_rest: set[int]):
         for slur_id, spec in list(self._slur_specs.items()):
@@ -4139,13 +4232,14 @@ class CompositionalUnit(TemporalUnit):
                 return False
             now = self._control_envelope_timing(
                 self._resolve_control_envelope_leaves(d),
-                self._split_group_span(d))
+                self._split_group_span(d), d["endpoint"])
             return now is not None and now != baked
 
-        descriptors = [d for d in descriptors
-                       if tuple(self._resolve_control_envelope_leaves(d))
-                       != tuple(d.get("baked_leaves") or ())
-                       or _timing_moved(d)]
+        with self._split_group_pass():
+            descriptors = [d for d in descriptors
+                           if tuple(self._resolve_control_envelope_leaves(d))
+                           != tuple(d.get("baked_leaves") or ())
+                           or _timing_moved(d)]
         if not descriptors:
             return
         pending = getattr(self, '_pending_envelope_rebakes', None)
@@ -4172,9 +4266,10 @@ class CompositionalUnit(TemporalUnit):
             return
         self._pending_envelope_rebakes = []
         live = list(self._control_envelopes.values())
-        for desc in pending:
-            if any(desc is held for held in live):
-                self._rebake_control_envelope(desc)
+        with self._split_group_pass():
+            for desc in pending:
+                if any(desc is held for held in live):
+                    self._rebake_control_envelope(desc)
 
     @contextmanager
     def _deferred_envelope_rebakes(self):
@@ -4695,9 +4790,15 @@ class CompositionalUnit(TemporalUnit):
                 # paid for once already.
                 "curve_window": desc.get("curve_window") or (0.0, 1.0),
                 "baked_leaves": desc.get("baked_leaves"),
-                # Carried, or the copy's split halves stop being a group and
-                # each freezes on the copy's first structural edit -- the same
-                # shape as the dropped ``curve_window`` above (AF35-4).
+                # Carried so the copy's halves stay one group. Note what this
+                # does NOT yet buy: a copied envelope does not rebake at all,
+                # because ``baked_timing`` is deliberately not carried three
+                # lines up, so the gate falls back to identity alone. Measured
+                # the same at ``e7a44ec`` and here -- it is pre-existing, it is
+                # ``AF35-47``, and until it is decided this carry is correct but
+                # inert. The earlier version of this comment claimed the halves
+                # would otherwise "freeze on the copy's first structural edit",
+                # which overclaims: they freeze either way today.
                 **({"split_group": desc["split_group"]}
                    if desc.get("split_group") is not None else {}),
             }

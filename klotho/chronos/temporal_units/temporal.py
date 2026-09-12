@@ -1731,6 +1731,12 @@ class TemporalUnit(_RepeatableTemporal, metaclass=TemporalMeta):
             out._slur_specs = self._copy_slur_specs()
             out._next_slur_id = self._next_slur_id
             out._control_envelopes = self._copy_control_envelopes()
+            # ...and the counter that MINTS group ids, or the copy's descriptors keep
+            # a group id this unit can mint again: two unrelated envelopes then read as
+            # one group and are re-sloped against a partition that describes neither.
+            out._next_envelope_split_group = max(
+                getattr(out, '_next_envelope_split_group', 0),
+                getattr(self, '_next_envelope_split_group', 0))
             out._next_envelope_id = self._next_envelope_id
             # Scaling scales the unit AS IT IS (Ryan, 2026-08-31), so the
             # draws a stochastic Bind has already made come across with

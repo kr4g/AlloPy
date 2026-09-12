@@ -1430,6 +1430,12 @@ def modulate_tempo(ut: Union[TemporalUnit, 'CompositionalUnit'], beat: Union[Fra
         new_cu._slur_specs = ut._copy_slur_specs()
         new_cu._next_slur_id = ut._next_slur_id
         new_cu._control_envelopes = ut._copy_control_envelopes()
+        # ...and the counter that MINTS group ids, or the copy's descriptors keep
+        # a group id this unit can mint again: two unrelated envelopes then read as
+        # one group and are re-sloped against a partition that describes neither.
+        new_cu._next_envelope_split_group = max(
+            getattr(new_cu, '_next_envelope_split_group', 0),
+            getattr(ut, '_next_envelope_split_group', 0))
         new_cu._next_envelope_id = ut._next_envelope_id
         # The modulation scales the unit AS IT IS: see TemporalUnit._scaled.
         # Draws already made by a stochastic Bind are part of the music being
@@ -1496,6 +1502,12 @@ def modulate_tempus(ut: Union[TemporalUnit, 'CompositionalUnit'], span: int, tem
         new_cu._slur_specs = ut._copy_slur_specs()
         new_cu._next_slur_id = ut._next_slur_id
         new_cu._control_envelopes = ut._copy_control_envelopes()
+        # ...and the counter that MINTS group ids, or the copy's descriptors keep
+        # a group id this unit can mint again: two unrelated envelopes then read as
+        # one group and are re-sloped against a partition that describes neither.
+        new_cu._next_envelope_split_group = max(
+            getattr(new_cu, '_next_envelope_split_group', 0),
+            getattr(ut, '_next_envelope_split_group', 0))
         new_cu._next_envelope_id = ut._next_envelope_id
         # The modulation scales the unit AS IT IS: see TemporalUnit._scaled.
         # Draws already made by a stochastic Bind are part of the music being
