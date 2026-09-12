@@ -1342,6 +1342,7 @@ class CompositionalUnit(TemporalUnit):
         self._next_slur_id = 0
         self._control_envelopes: dict[int, dict] = {}
         self._next_envelope_id = 0
+        self._next_envelope_split_group = 0
         self._mirror_id_map = None
         self._mirror_bind_targets = None
         self._rt.set_id_state_observer(self._relocate_id_keyed_state)
@@ -2582,7 +2583,7 @@ class CompositionalUnit(TemporalUnit):
                     f"existing_pfields={sorted(desc['pfields'])})"
                 )
 
-    def _control_envelope_timing(self, leaves):
+    def _control_envelope_timing(self, leaves, span_leaves=None):
         """The span's own RELATIVE geometry, as a comparable signature.
 
         ``baked_leaves`` answers *which* leaves the stored values were computed
@@ -2603,6 +2604,18 @@ class CompositionalUnit(TemporalUnit):
         change must read as unchanged and only a change in relative layout must
         read as stale.
 
+        ``span_leaves`` is the span to normalise AGAINST, and it is what makes
+        the signature usable on a SPLIT envelope (AF35-4). A split descriptor
+        covers one instrument run, but what its baked values depend on is where
+        that run sits inside the WHOLE envelope -- so normalising a run against
+        itself discards the only thing that can go stale. One leaf is the
+        extreme case and the one that was measured: a single-leaf run normalised
+        against itself is the constant ``((0.0, 1.0),)`` whatever its onset and
+        duration, so the gate compared a constant against itself, could never
+        fire, and the half stayed frozen at its pre-edit values through every
+        structural edit. Defaults to ``leaves``, which is the whole span exactly
+        when the envelope is unsplit.
+
         Returns ``None`` when the geometry cannot be read -- a leaf without a
         metric layer, which happens mid-mutation, or a degenerate zero-width
         span. ``None`` means *unknown*, and the gate treats unknown as "no timing
@@ -2612,6 +2625,9 @@ class CompositionalUnit(TemporalUnit):
         leaves = tuple(leaves)
         if not leaves:
             return ()
+        span = tuple(span_leaves) if span_leaves is not None else leaves
+        if not span:
+            return None
         try:
             self._ensure_timing_cache()
             times = self._real_times
@@ -2624,8 +2640,16 @@ class CompositionalUnit(TemporalUnit):
                 return None
             rows.append((float(entry['real_onset']),
                          abs(float(entry['real_duration']))))
-        start = min(o for o, _ in rows)
-        end = max(o + d for o, d in rows)
+        span_rows = rows if span == leaves else []
+        if not span_rows:
+            for n in span:
+                entry = times.get(n)
+                if entry is None:
+                    return None
+                span_rows.append((float(entry['real_onset']),
+                                  abs(float(entry['real_duration']))))
+        start = min(o for o, _ in span_rows)
+        end = max(o + d for o, d in span_rows)
         width = end - start
         if width <= 0:
             return None
@@ -2634,7 +2658,94 @@ class CompositionalUnit(TemporalUnit):
         return tuple((round((o - start) / width, 9), round(d / width, 9))
                      for o, d in rows)
 
+    def _split_group_members(self, desc):
+        """The live descriptors that came from the same ``apply_envelope`` call.
+
+        An envelope that crosses an instrument change is stored as one
+        descriptor per run, each carrying its own slice of the whole curve
+        (``curve_window``). Those slices are only meaningful TOGETHER: run *k*
+        stretches the full curve so that its window lands on its own leaves, so
+        every run's window is a statement about where it sits inside the whole
+        span. ``split_group`` is what lets a run find the rest of that span
+        after the fact -- without it a descriptor knows its own leaves and
+        nothing else, which is why both the staleness signature and the window
+        were computed against the run alone and went stale silently (AF35-4).
+
+        Returns ``[(descriptor, leaves), ...]`` in curve order, or ``None`` when
+        the descriptor is unsplit or the geometry cannot be read -- mid-mutation
+        a leaf may have no metric layer yet, and ``None`` keeps every caller on
+        its pre-split behaviour rather than guessing.
+
+        A member removed on its own through :meth:`remove_envelope` leaves the
+        group covering less than the original span, and the survivors are then
+        re-sloped across what remains. The documented round trip removes the
+        whole group at once (``apply_envelope`` returns the list for exactly
+        that reason), so this is the undocumented edge; ``AF35-44`` carries the
+        musical question of what a partial removal should mean.
+        """
+        group = desc.get("split_group")
+        if group is None:
+            return None
+        members = [d for d in self._control_envelopes.values()
+                   if d.get("split_group") == group]
+        if len(members) < 2:
+            return None
+        try:
+            self._ensure_timing_cache()
+            times = self._real_times
+        except Exception:
+            return None
+        rows = []
+        for d in members:
+            leaves = tuple(self._resolve_control_envelope_leaves(d))
+            if not leaves or any(times.get(n) is None for n in leaves):
+                return None
+            rows.append((min(float(times[n]['real_onset']) for n in leaves),
+                         d, leaves))
+        rows.sort(key=lambda r: r[0])
+        return [(d, leaves) for _, d, leaves in rows]
+
+    def _split_group_span(self, desc):
+        """The whole envelope's live leaves, for a descriptor that is one run.
+
+        ``None`` for an unsplit descriptor, whose own leaves already ARE the
+        whole span. Side-effect free: the rebake gate reads it.
+        """
+        members = self._split_group_members(desc)
+        if members is None:
+            return None
+        return [n for _, leaves in members for n in leaves]
+
+    def _refresh_split_windows(self, desc):
+        """Recompute the whole group's curve windows against today's geometry.
+
+        The windows were computed once, at the split, and then never again --
+        so after any structural edit each half sampled a slice of the curve
+        that no longer matched where its leaves had moved to. That reached two
+        surfaces: the baked pfields (``uc.events``) and, through
+        :meth:`resolved_control_envelopes`, the control-bus automation that
+        actually makes the sound.
+
+        Returns the group's whole span for the signature to normalise against,
+        or ``None`` when there is no group or the geometry is unreadable.
+        """
+        members = self._split_group_members(desc)
+        if members is None:
+            return None
+        runs = [leaves for _, leaves in members]
+        try:
+            windows = self._curve_windows(runs, desc["endpoint"])
+        except Exception:
+            return None
+        for (d, _), window in zip(members, windows):
+            d["curve_window"] = window
+        return [n for run in runs for n in run]
+
     def _rebake_control_envelope(self, desc):
+        # The window has to be brought up to date BEFORE the bake reads it.
+        # A split descriptor's window is its position inside the whole span,
+        # and a structural edit is exactly the thing that moves it.
+        span = self._refresh_split_windows(desc)
         sounding = self._resolve_control_envelope_leaves(desc)
         if sounding:
             # ``curve_window`` must ride through, or the first structural
@@ -2644,7 +2755,7 @@ class CompositionalUnit(TemporalUnit):
                                 desc["endpoint"],
                                 curve_window=desc.get("curve_window"))
         desc["baked_leaves"] = tuple(sounding)
-        desc["baked_timing"] = self._control_envelope_timing(sounding)
+        desc["baked_timing"] = self._control_envelope_timing(sounding, span)
 
     def _record_control_envelope(self, selected, envelope, pfields_list, endpoint):
         self._ensure_timing_cache()
@@ -2671,6 +2782,12 @@ class CompositionalUnit(TemporalUnit):
         # over sounding notes, an envelope is a curve over a span, so a
         # one-leaf run is still a legitimate envelope.
         runs = self._partition_by_instrument(sounding)
+        # One group id per apply_envelope call that splits, so each run can
+        # find the rest of its own span later -- see ``_split_group_members``.
+        split_group = None
+        if len(runs) > 1:
+            split_group = self._next_envelope_split_group
+            self._next_envelope_split_group += 1
         env_ids = []
         for run, window in zip(runs, self._curve_windows(runs, endpoint)):
             self._bake_envelope(run, envelope, pfields_list, endpoint,
@@ -2691,11 +2808,19 @@ class CompositionalUnit(TemporalUnit):
                 "baked_leaves": tuple(run),
                 # ...and WHEN they were computed. ``scale`` moves every onset
                 # without touching the leaf set, so the set alone cannot see it.
-                "baked_timing": self._control_envelope_timing(run),
+                # Normalised to the WHOLE span, not to this run: a run signed
+                # against itself cannot see its own position move, and a
+                # one-leaf run signed against itself is a constant (AF35-4).
+                "baked_timing": self._control_envelope_timing(run, sounding),
                 # the slice of the whole curve this descriptor carries, so a
                 # later rebake reproduces its VALUES rather than restarting
                 # the gesture. ``(0.0, 1.0)`` for an unsplit envelope.
                 "curve_window": window,
+                # Absent means unsplit, exactly as an absent ``curve_window``
+                # means the whole curve. Storing ``None`` instead would add a
+                # key to every descriptor that has ever been serialised --
+                # which is what the parity oracle caught.
+                **({"split_group": split_group} if split_group is not None else {}),
             }
             env_ids.append(env_id)
         if not env_ids:
@@ -3310,7 +3435,15 @@ class CompositionalUnit(TemporalUnit):
             return
         start, end = desc.get("curve_window") or (0.0, 1.0)
         width = end - start
+        # A split of an already-split run joins the SAME group: the group is
+        # the whole original gesture, however many times it has been cut, so
+        # its span stays the span every window is a fraction of.
+        split_group = desc.get("split_group")
+        if split_group is None:
+            split_group = self._next_envelope_split_group
+            self._next_envelope_split_group += 1
         del self._control_envelopes[env_id]
+        whole = tuple(resolved)
         for run, (inner_start, inner_end) in zip(
                 runs, self._curve_windows(runs, desc["endpoint"])):
             new_id = env_id if run is runs[0] else self._next_envelope_id
@@ -3320,9 +3453,10 @@ class CompositionalUnit(TemporalUnit):
                 **desc,
                 "leaf_subset": tuple(run),
                 "baked_leaves": tuple(run),
-                "baked_timing": self._control_envelope_timing(run),
+                "baked_timing": self._control_envelope_timing(run, whole),
                 "curve_window": (start + inner_start * width,
                                  start + inner_end * width),
+                "split_group": split_group,
             }
 
     def _split_slurs_for_rests(self, nodes_to_rest: set[int]):
@@ -3952,7 +4086,8 @@ class CompositionalUnit(TemporalUnit):
             if baked is None:
                 return False
             now = self._control_envelope_timing(
-                self._resolve_control_envelope_leaves(d))
+                self._resolve_control_envelope_leaves(d),
+                self._split_group_span(d))
             return now is not None and now != baked
 
         descriptors = [d for d in descriptors
@@ -4505,7 +4640,14 @@ class CompositionalUnit(TemporalUnit):
                 # paid for once already.
                 "curve_window": desc.get("curve_window") or (0.0, 1.0),
                 "baked_leaves": desc.get("baked_leaves"),
+                # Carried, or the copy's split halves stop being a group and
+                # each freezes on the copy's first structural edit -- the same
+                # shape as the dropped ``curve_window`` above (AF35-4).
+                **({"split_group": desc["split_group"]}
+                   if desc.get("split_group") is not None else {}),
             }
+        new_cu._next_envelope_split_group = max(
+            new_cu._next_envelope_split_group, self._next_envelope_split_group)
 
         return new_cu
     
@@ -4606,6 +4748,7 @@ class CompositionalUnit(TemporalUnit):
         c._next_slur_id = self._next_slur_id
         c._control_envelopes = self._copy_control_envelopes(follow_mirror=False)
         c._next_envelope_id = self._next_envelope_id
+        c._next_envelope_split_group = self._next_envelope_split_group
         c._mirror_id_map = None
         c._mirror_bind_targets = None
         c._rt.set_id_state_observer(c._relocate_id_keyed_state)
@@ -4673,6 +4816,8 @@ class CompositionalUnit(TemporalUnit):
                 "leaf_subset": subset,
                 "curve_window": desc.get("curve_window") or (0.0, 1.0),
                 "baked_leaves": desc.get("baked_leaves"),
+                **({"split_group": desc["split_group"]}
+                   if desc.get("split_group") is not None else {}),
             }
         return descs
 
@@ -4776,8 +4921,11 @@ class CompositionalUnit(TemporalUnit):
                 "leaf_subset": mapped_leaf_subset,
                 "curve_window": desc.get("curve_window") or (0.0, 1.0),
                 "baked_leaves": desc.get("baked_leaves"),
+                **({"split_group": desc["split_group"]}
+                   if desc.get("split_group") is not None else {}),
             }
         c._next_envelope_id = self._next_envelope_id
+        c._next_envelope_split_group = self._next_envelope_split_group
 
         c._attributed = self._attributed  # rebuild passed every slot; restore truth
         c._offset = self._offset

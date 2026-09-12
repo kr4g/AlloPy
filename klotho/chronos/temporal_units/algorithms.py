@@ -58,6 +58,16 @@ def _reanchor_contained_envelopes(original_uc, sub_uc, group):
             # dropping it restarts each half of a split envelope the first
             # time the sub-unit is edited.
             "curve_window": desc.get("curve_window") or (0.0, 1.0),
+            # ``split_group`` is deliberately NOT carried. It says "these
+            # descriptors partition one span", and the re-anchoring two lines
+            # up destroys exactly that: every survivor gets the sub-unit's
+            # root and ``leaf_subset=None``, so they all re-resolve to ALL of
+            # the sub-unit's leaves and no longer partition anything. Carried,
+            # the group would re-slope its members against a degenerate
+            # partition; dropped, each is an ordinary full-span descriptor
+            # keeping its inherited window, which is what this path already
+            # meant. ``AF35-45`` carries the pre-existing overlap that makes
+            # this true.
         }
 
 
