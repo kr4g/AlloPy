@@ -2733,12 +2733,16 @@ class CompositionalUnit(TemporalUnit):
         a leaf may have no metric layer yet, and ``None`` keeps every caller on
         its pre-split behaviour rather than guessing.
 
-        A member removed on its own through :meth:`remove_envelope` leaves the
-        group covering less than the original span, and the survivors are then
-        re-sloped across what remains. The documented round trip removes the
-        whole group at once (``apply_envelope`` returns the list for exactly
-        that reason), so this is the undocumented edge; ``AF35-44`` carries the
-        musical question of what a partial removal should mean.
+        A member removed on its own through :meth:`remove_envelope`, or emptied
+        by resting its every leaf, leaves the group covering less than the
+        original span. The survivors are then re-sloped across what remains --
+        **at every group size, including one survivor**, which is the whole
+        reason the bail below is on an empty list rather than on "fewer than
+        two". The documented round trip removes the whole group at once
+        (``apply_envelope`` returns the list for exactly that reason), so this is
+        the undocumented edge; ``AF35-44`` carries the musical question of what a
+        partial removal should mean, and until it is answered this at least
+        answers it the same way every time.
         """
         group = desc.get("split_group")
         if group is None:
@@ -2748,7 +2752,7 @@ class CompositionalUnit(TemporalUnit):
             return cache[group]
         members = [d for d in self._control_envelopes.values()
                    if d.get("split_group") == group]
-        if len(members) < 2:
+        if not members:
             if cache is not None:
                 cache[group] = None
             return None
@@ -2774,8 +2778,21 @@ class CompositionalUnit(TemporalUnit):
                 return None
             rows.append((min(float(times[n]['real_onset']) for n in leaves),
                          d, leaves))
-        if len(rows) < 2:
+        if not rows:
             return None
+        # ONE readable member is still a group, and this is deliberate. Stopping
+        # at "fewer than two" left the last survivor holding the partial window
+        # it had been cut to -- so it baked a SLICE of the curve where the same
+        # envelope cut into three runs re-slopes its survivors across the whole
+        # of it. One musical question answered two ways by how many runs the
+        # envelope happened to be cut into. The live members always tile the
+        # full curve now, whatever their number.
+        #
+        # WHICH answer is right -- does deleting the tail of a hairpin shorten
+        # the hairpin, or silence its last third? -- is ``AF35-44`` and is
+        # Ryan's. This pins the behaviour that already shipped for three or more
+        # onto every size, so a ruling either way moves them together instead of
+        # having to find this corner separately.
         rows.sort(key=lambda r: r[0])
         result = [(d, leaves) for _, d, leaves in rows]
         if cache is not None:

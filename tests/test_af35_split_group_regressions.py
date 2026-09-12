@@ -197,3 +197,39 @@ def test_the_rebake_gate_is_linear_in_the_number_of_descriptors():
     assert c64 < c32 * 3, (
         f"resolve count grew {c64 / c32:.1f}x for 2x the descriptors "
         f"({c32} at {d32} descriptors, {c64} at {d64}) -- still superlinear")
+
+
+# ---------------------------------------------------------------- D4, part two
+@pytest.mark.parametrize("endpoint", [True, False])
+@pytest.mark.parametrize("n_runs", [2, 3, 4])
+def test_an_emptied_run_behaves_the_same_whatever_the_group_size(endpoint, n_runs):
+    """The live members of a group tile the whole curve, however many remain.
+
+    Skipping an emptied run let the survivors re-slope across their union -- but
+    only while at least two of them stayed readable. With exactly one survivor
+    the helper gave up, the survivor kept the partial window it had been cut to,
+    and it baked a slice of the curve instead of the whole of it. Measured at
+    two runs: `[0.2, 0.35, 0.5, 0.65]` against the unsplit oracle's
+    `[0.2, 0.2, 0.4, 0.6]`, with the survivor still holding `(0.25, 1.0)`.
+
+    So the code answered ONE musical question two ways depending on how many
+    runs the envelope happened to be cut into. That inconsistency is the defect
+    here; WHICH answer is right is `AF35-44`, which is Ryan's and is still open.
+    This pins the >= 3 behaviour that was already shipped onto every group size,
+    so a ruling either way moves them together.
+    """
+    def build(split):
+        uc = UC(tempus='4/4', prolatio=(1, 1, 1, 1), beat='1/4', bpm=120)
+        L = uc._rt.leaf_nodes
+        uc.set_instrument(L, 'kl_saw')
+        if split:
+            for i in range(n_runs - 1):
+                uc._rt.set_instrument(L[i], 'kl_pluck' if i % 2 else 'kl_tri')
+        uc.apply_envelope(Envelope([0.2, 0.8]), 'amp', 0,
+                          control=True, endpoint=endpoint)
+        uc._rt.make_rest(uc._rt.leaf_nodes[0])   # empties the first run
+        uc._rt.scale(0, 3)
+        return uc
+
+    assert _amps(build(True)) == _amps(build(False))
+
