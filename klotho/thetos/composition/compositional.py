@@ -190,6 +190,45 @@ class CompositionalTree(ParameterApiMixin, RhythmTree):
         finally:
             self._announcing_leaf_surface = False
 
+    @contextmanager
+    def _instrument_announcements_held(self):
+        """Bind several nodes, then announce once.
+
+        ``UC.set_instrument`` writes a whole selection and resplits at the
+        end. Without this, the per-node door below would announce inside that
+        loop and split the overlay against a HALF-BOUND selection, once per
+        node.
+        """
+        self._suppress_instrument_announce = getattr(
+            self, '_suppress_instrument_announce', 0) + 1
+        try:
+            yield
+        finally:
+            self._suppress_instrument_announce -= 1
+
+    def set_instrument(self, node, instrument):
+        """Bind an instrument at *node*, then announce the surface change.
+
+        An overlay splits at an instrument change (Ryan, 2026-08-31), and
+        ``UC.set_instrument`` has always done that eagerly at the end of its
+        own write. This door did not, so the two public doors to one operation
+        left the unit in two different states -- one descriptor against three
+        -- and the split was then attempted LAZILY, from inside
+        ``RhythmTree._respell``, where the new nodes have no metric layer yet
+        and it died with ``KeyError: 'metric_duration'`` (AF35-3).
+
+        Announcing here is the same seam every structural verb in this class
+        already uses: ``super()`` has returned, the metric layer is complete,
+        and ``_relocate_id_keyed_state`` reaches one implementation of the
+        split rather than two answers to one musical question. Binding moves
+        no ids, so the relocation is the identity and every other overlay
+        handler is a no-op.
+        """
+        result = super().set_instrument(node, instrument)
+        if not getattr(self, '_suppress_instrument_announce', 0):
+            self._announce_leaf_surface_change()
+        return result
+
     def subdivide(self, node, S):
         """Subdivide leaf node(s) (see :meth:`RhythmTree.subdivide`),
         announcing the leaf-surface change so overlays drop the
@@ -3573,8 +3612,21 @@ class CompositionalUnit(TemporalUnit):
         # span, not an arc over notes -- so it splits here, through the SAME
         # method ``set_instrument`` uses. One implementation, because two
         # would be two answers to one musical question.
-        for env_id, desc in list(self._control_envelopes.items()):
-            self._split_envelope_at_instrument_changes(env_id, desc)
+        #
+        # Gated on the announcement for the reason the paragraph above spells
+        # out, and which the split half was written straight past: this
+        # observer is ALSO reached mid-mutation, from ``Tree.insert_child``
+        # and from ``RhythmTree._respell``, and at those two moments the new
+        # nodes have no metric layer, so ``_curve_windows`` ->
+        # ``_ensure_timing_cache`` dies with ``KeyError: 'metric_duration'``
+        # (AF35-3). Every verb that can create an instrument boundary --
+        # ``scale``, ``insert``, ``extract``, ``insert_child``,
+        # ``graft_subtree``, ``subdivide``, and now ``set_instrument`` --
+        # announces again once ``super()`` has returned, so nothing that
+        # needs healing is lost by waiting for the safe moment.
+        if getattr(self._rt, '_announcing_leaf_surface', False):
+            for env_id, desc in list(self._control_envelopes.items()):
+                self._split_envelope_at_instrument_changes(env_id, desc)
         # a correspondence published to a mirror target is keyed by the ids
         # that just moved, so it no longer describes this unit
         self._mirror_id_map = None
@@ -4339,47 +4391,50 @@ class CompositionalUnit(TemporalUnit):
         """
         targets = self._coerce_node_targets(node)
 
-        if isinstance(instrument, (str, int)):
-            _reject_fx_as_instrument(instrument)
-            for n in targets:
-                self._rt.set_instrument(n, instrument)
-        elif isinstance(instrument, (Instrument, Effect)):
-            if not isinstance(instrument, Effect):
-                _reject_fx_as_instrument(getattr(instrument, 'defName', None))
-            family = getattr(instrument, '_ensemble_family', None)
-            with self._rt.batch_writes():
+        # Held across the whole write: the tree door announces per node, and
+        # this door resplits ONCE at the end, against the finished selection.
+        with self._rt._instrument_announcements_held():
+            if isinstance(instrument, (str, int)):
+                _reject_fx_as_instrument(instrument)
                 for n in targets:
                     self._rt.set_instrument(n, instrument)
-                    if family is not None:
-                        self._rt.set_mfields(n, group=family)
-        elif callable(instrument) or isinstance(instrument, Pattern):
-            if not include_rests:
-                targets = [n for n in targets
-                           if self._rt[n].get('proportion', 1) >= 0]
-            total = len(targets)
-            arity = (None if isinstance(instrument, Pattern)
-                     else _callable_arity(instrument))
-            with self._rt.batch_writes():
-                for i, n in enumerate(targets):
-                    if isinstance(instrument, Pattern):
-                        inst = next(instrument)
-                    else:
-                        ctx = _build_pfield_context(
-                            self, n, i, total,
-                            is_rest=self._rt[n].get('proportion', 1) < 0
-                        )
-                        inst = instrument(ctx) if arity >= 1 else instrument()
-                    if inst is not None:
-                        if isinstance(inst, str):
-                            _reject_fx_as_instrument(inst)
-                        elif isinstance(inst, Instrument) and not isinstance(inst, Effect):
-                            _reject_fx_as_instrument(getattr(inst, 'defName', None))
-                        self._rt.set_instrument(n, inst)
-                        family = getattr(inst, '_ensemble_family', None)
+            elif isinstance(instrument, (Instrument, Effect)):
+                if not isinstance(instrument, Effect):
+                    _reject_fx_as_instrument(getattr(instrument, 'defName', None))
+                family = getattr(instrument, '_ensemble_family', None)
+                with self._rt.batch_writes():
+                    for n in targets:
+                        self._rt.set_instrument(n, instrument)
                         if family is not None:
                             self._rt.set_mfields(n, group=family)
-        else:
-            raise TypeError(_instrument_shape_error(instrument))
+            elif callable(instrument) or isinstance(instrument, Pattern):
+                if not include_rests:
+                    targets = [n for n in targets
+                               if self._rt[n].get('proportion', 1) >= 0]
+                total = len(targets)
+                arity = (None if isinstance(instrument, Pattern)
+                         else _callable_arity(instrument))
+                with self._rt.batch_writes():
+                    for i, n in enumerate(targets):
+                        if isinstance(instrument, Pattern):
+                            inst = next(instrument)
+                        else:
+                            ctx = _build_pfield_context(
+                                self, n, i, total,
+                                is_rest=self._rt[n].get('proportion', 1) < 0
+                            )
+                            inst = instrument(ctx) if arity >= 1 else instrument()
+                        if inst is not None:
+                            if isinstance(inst, str):
+                                _reject_fx_as_instrument(inst)
+                            elif isinstance(inst, Instrument) and not isinstance(inst, Effect):
+                                _reject_fx_as_instrument(getattr(inst, 'defName', None))
+                            self._rt.set_instrument(n, inst)
+                            family = getattr(inst, '_ensemble_family', None)
+                            if family is not None:
+                                self._rt.set_mfields(n, group=family)
+            else:
+                raise TypeError(_instrument_shape_error(instrument))
         # An overlay splits at an instrument change (Ryan, 2026-08-31), and
         # this is where a change actually happens. Authoring and the
         # structural heal cannot cover it between them: binding a leaf moves
